@@ -58,6 +58,7 @@ class TableCache:
         self.device = device
         self.asset = next((table for table in (manifest or {}).get('adaln_tables', [])
                            if table['identity'] == self.identity), None)
+        self.optional_asset = None
         self.root = Path(root) / assets.directory(self.identity)
         self.producer = None
         if self.asset is not None:
@@ -107,6 +108,8 @@ class TableCache:
                 raise ValueError('AdaLN table cache identity mismatch')
         else:
             save(marker, self.identity)
+        if manifest is not None:
+            self.optional_asset = assets.optional_table(self.identity, manifest)
 
     def load(self, index, steps):
         from . import adaln_assets as assets
@@ -119,7 +122,9 @@ class TableCache:
             if row is None:
                 raise ValueError('Incomplete AdaLN model asset')
         elif not path.is_file() or not marker.is_file():
-            return None
+            if self.optional_asset is None:
+                return None
+            row = assets.download_table(self.root, self.optional_asset, index)
         else:
             row = json.loads(marker.read_text(encoding='utf-8'))
         assets.check_table(path, row, self.identity)
@@ -130,7 +135,7 @@ class TableCache:
             raise ValueError('Nonfinite AdaLN model asset')
         return [state[f'step_{i}'].chunk(6, dim=-1) for i in range(steps)]
 
-    def save(self, index, module):
+    def save(self, index, module, *, producer_device=None):
         from . import adaln_assets as assets
         from .monitoring import save
         if self.asset is not None:
@@ -148,13 +153,18 @@ class TableCache:
         provenance = self.root / 'producer.json'
         if not provenance.exists():
             from diffusers.models.transformers import transformer_minimax_h3
-            save(provenance, {'torch': str(torch.__version__), 'cuda': torch.version.cuda,
+            producer = {'torch': str(torch.__version__), 'cuda': torch.version.cuda,
                 'gpu': torch.cuda.get_device_name() if str(self.device).startswith('cuda') else 'cpu',
                 'implementation': assets.file_hash(__file__),
                 'original_implementation': assets.file_hash(transformer_minimax_h3.__file__),
                 'matmul_precision': torch.get_float32_matmul_precision(),
                 'tf32': torch.backends.cuda.matmul.allow_tf32,
-                'bf16_reduced_reduction': torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction})
+                'bf16_reduced_reduction': torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction}
+            if producer_device is not None:
+                # Storage/loading can be CPU even when constants were computed
+                # on Metal. Existing CUDA callers keep their original receipt.
+                producer.update(device_backend=producer_device, gpu=producer_device)
+            save(provenance, producer)
 
 
 @torch.no_grad()
