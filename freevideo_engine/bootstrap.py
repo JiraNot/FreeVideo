@@ -29,7 +29,7 @@ from .locking import runtime_lock, LOCK_ENV
 from .environments import ENVIRONMENTS, environment_names, select_layout, role_pythons, constraints_file, bootstrap_versions
 from . import network
 from . import processes
-from .system import install_root, venv_python, system_memory, nvidia_smi, memory_sample
+from .system import install_root, venv_python, system_memory, nvidia_smi, memory_sample, curl_executable, missing_curl_message
 
 PACKAGE = Path(__file__).resolve().parent
 SOURCE = PACKAGE.parent
@@ -185,12 +185,21 @@ def inventory(gpu=None):
     if len(matches) != 1:
         raise ValueError('Select one physical GPU by nvidia-smi index or full UUID with --gpu. MIG is not supported.')
     selected = matches[0]
+    try:
+        capability = tuple(map(int, selected['compute_cap'].split('.')))
+        if len(capability) != 2:
+            capability = (0, 0)
+    except (TypeError, ValueError):
+        # Keep the raw driver result in inventory for the exported report.
+        # Unknown must not be presented as an unsupported old GPU architecture.
+        capability = (0, 0)
     ram = system_memory()
     limit, available = cgroup_capacity()
-    hardware = Hardware(selected['name'], tuple(map(int, selected['compute_cap'].split('.'))),
+    hardware = Hardware(selected['name'], capability,
         int(float(selected['memory.total']) * 2**20), int(float(selected['memory.free']) * 2**20),
         ram['total_bytes'], min(ram['available_bytes'], available) if available is not None else ram['available_bytes'],
-        platform.system(), cgroup_ram_limit=limit)
+        platform.system(), cgroup_ram_limit=limit, gpu_uuid=selected['uuid'],
+        driver_version=selected['driver_version'])
     return {'hardware': hardware.to_dict(), 'selected_gpu': selected, 'gpus': rows,
             'kernel': platform.release(), 'platform': platform.platform(), 'machine': platform.machine(),
             'cpu_threads': os.cpu_count(), 'swap_total_bytes': ram.get('swap_total_bytes'),
@@ -210,6 +219,10 @@ def prepared_precision(prepared):
 
 
 def model_target(row, model_dir, encoder_dir, prepared_dir=None):
+    if row.get('sampling_file'):
+        from .adaln_assets import asset_path
+        from .sampling_assets import cache_root
+        return asset_path(cache_root(model_dir), row['sampling_file'])
     if row.get('role') == 'latent_upscaler':
         return model_dir / 'latent_upscaler' / Path(row['file']).name
     if row.get('prepared'):
@@ -256,13 +269,16 @@ def plan(args, *, local_progress=None):
             errors.append('Windows uses the pinned, verified Sage2 wheel; --rebuild-sage is a Linux source-build option.')
         if int(snapshot['selected_gpu']['driver_version'].split('.')[0]) < 580:
             errors.append('NVIDIA driver 580 or newer is required by the pinned CUDA 13 encoder; update the driver first.')
-        if hardware.capability not in ((8, 0), (8, 6), (8, 9), (9, 0), (12, 0)):
-            errors.append('The one-click profiles currently target SM80/86, SM89, SM90 and SM120.')
+        compatibility = hardware.cuda_compatibility()
+        if compatibility['error']:
+            errors.append(compatibility['error'])
+        snapshot['cuda_compatibility'] = compatibility
         for name in () if windows_target else ('git', 'compiler'):
             if not snapshot.get(name):
                 errors.append('Missing %s. Run ./setup.sh interactively to install basic tools, then review the engine plan.' % name)
-        if not args.hardware_json and not shutil.which('curl'):
-            errors.append('Missing curl for bounded downloads and HTTP/SOCKS proxy support. Run ./setup.sh to install it.')
+        curl_env = dict(os.environ, FREEVIDEO_HOME=str(root))
+        if not args.hardware_json and curl_executable(curl_env) is None:
+            errors.append(missing_curl_message(curl_env))
         resources = None
         try:
             resources = resource_budget(hardware, vram_gib=vram_gib, ram_gib=ram_gib)
@@ -297,6 +313,16 @@ def plan(args, *, local_progress=None):
         errors.append('No verified native-compatible prepared model is available. Source conversion is not supported on Mac.')
     files = required_models(json.loads((PACKAGE / 'model_files.json').read_text(encoding='utf-8')), reuse_cache or prepared)
     files += prepared_model.files(prepared)
+    # New installations prepare every quality level; an existing one keeps its
+    # earlier choice (off if it predates the option) unless the flag says otherwise.
+    sampling_caches = getattr(args, 'sampling_caches', None)
+    if sampling_caches is None:
+        sampling_caches = prior['sampling_caches'] if isinstance(prior.get('sampling_caches'), bool) else not saved.get('ready')
+    sampling_caches = bool(sampling_caches)
+    from .sampling_assets import install_files, usable_with
+    if prepared or (reuse_cache and usable_with(reuse_cache)):
+        # Published tables match these weights; other caches compute their own.
+        files += install_files(sampling_caches)
     local_reuse = None
     local_folder = getattr(args, 'reuse_models', None)
     local_manifest = getattr(args, 'reuse_models_manifest', None)
@@ -370,6 +396,7 @@ def plan(args, *, local_progress=None):
         bootstrap_versions(json.loads((PACKAGE / 'bootstrap_versions.json').read_text(encoding='utf-8')), system), layout,
         mode=getattr(args, 'network', 'auto'), timeout=getattr(args, 'network_timeout', 5),
         offline=bool(args.hardware_json or errors),
+        env=dict(os.environ, FREEVIDEO_HOME=str(root)),
         proxy_mode=download_preferences(root / 'download-settings.json')['proxy_mode'])
     networking['download_settings_path'] = str(root / 'download-settings.json')
     prepared_missing = prepared and any(
@@ -408,7 +435,7 @@ def plan(args, *, local_progress=None):
             'dependencies': dependencies,
             'model_dir': str(model_dir), 'encoder_dir': str(encoder_dir),
             'reuse_cache': str(reuse_cache) if reuse_cache else None,
-            'prepared_model': prepared,
+            'prepared_model': prepared, 'sampling_caches': sampling_caches,
             'model_source': 'prepared' if prepared else 'existing' if reuse_cache else 'source',
             'model_source_reason': ('Pinned slim model, matching the existing GPU precision policy' if prepared else
                                     'Reuse existing compatible cache' if reuse_cache else
@@ -440,6 +467,8 @@ def plan(args, *, local_progress=None):
     if mac_target:
         from .macos_bootstrap import describe_plan
         describe_plan(value)
+    else:
+        value['cuda_compatibility'] = compatibility
     return value
 
 
@@ -589,7 +618,7 @@ def confirmed(args, value, ask=input, ui=None):
         if not args.yes or not args.accept_model_license:
             raise ValueError('--approved-plan requires explicit plan/license acceptance.')
         reviewed = json.loads(Path(reviewed_path).read_text(encoding='utf-8'))
-        keys = ('root', 'engine_version', 'environment_layout', 'model_dir', 'encoder_dir', 'vram_gib', 'ram_gib', 'reuse_cache', 'storage', 'storage_cleanup', 'model_downloader', 'prepared_model', 'model_source', 'disk_mode', 'frontend')
+        keys = ('root', 'engine_version', 'environment_layout', 'model_dir', 'encoder_dir', 'vram_gib', 'ram_gib', 'reuse_cache', 'storage', 'storage_cleanup', 'model_downloader', 'prepared_model', 'model_source', 'disk_mode', 'frontend', 'sampling_caches')
         changed = any(reviewed.get(key) != value.get(key) for key in keys)
         changed |= reviewed.get('device_backend') != value.get('device_backend')
         if value.get('device_backend') == 'mps':
@@ -1396,6 +1425,9 @@ def main(argv=None):
     parser.add_argument('--environment', choices=('unified', 'dual'),
                         help='New installs default to unified; updates retain their saved layout. Existing environments are kept when switching.')
     parser.add_argument('--models', type=Path, help='Reuse/download official model files in this directory')
+    parser.add_argument('--sampling-caches', action=argparse.BooleanOptionalAction, default=None,
+                        help='Install every quality level in advance (default for new installations; existing ones keep '
+                             'their choice). The default 8 + 3 refinement tables are always installed.')
     parser.add_argument('--model-source', choices=('prepared', 'source'), default='prepared',
                         help='Default: download a pinned slim model matching the GPU format. source: explicitly download original weights and convert locally')
     parser.add_argument('--encoder-models', type=Path, help='Directory containing text_encoders/')
@@ -1446,6 +1478,11 @@ def main(argv=None):
                     verbose=args.verbose, show_location=args.verbose)
     try:
         from .local_models import progress_output
+        if platform.system() == 'Windows' and not args.plan:
+            from .curl_windows import ensure
+            def curl_progress(message):
+                print(json.dumps(message), flush=True)
+            os.environ['FREEVIDEO_CURL'] = ensure(args.root, progress=curl_progress)
         value = plan(args, local_progress=progress_output if os.environ.get('FREEVIDEO_UI_EVENTS') == '1' or not args.json else None)
     except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
         print('Preflight failed: ' + str(error), file=sys.stderr)

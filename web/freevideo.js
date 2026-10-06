@@ -9,6 +9,7 @@ import { startUpdateChecks } from './updates.js';
 import { installNavigation, refreshNavigation, preferredView } from './view_navigation.js';
 import { attachReferencePicker, referenceItems, syncReferencePrompt } from './prompt_references.js';
 import { outputDownloadURL } from './output_download.js';
+import { shareButton } from './share.js';
 import { regenerateResult } from './studio_queue.js';
 
 const languageOverride = typeof location !== 'undefined'
@@ -245,12 +246,21 @@ function resultPanel(node) {
     node.addDOMWidget("freevideo_result", "freevideo_result", panel, {serialize: false, getMinHeight: panelHeight, getMaxHeight: panelHeight});
     const connected = node.onConnectionsChange, configured = node.onConfigure;
     node.onConnectionsChange = function (...args) { const result = connected?.apply(this, args); warn(); queueMicrotask(syncPrompts); return result; };
+    // Nodes made from now on carry the 8 + 3 default; a later choice of 8 + 2 is kept.
+    node.properties ??= {};
+    node.properties.freevideo_refine_v3 = true;
     node.onConfigure = function (...args) {
         const result = configured?.apply(this, args);
         // The earlier private test put a force checkbox at this position,
         // before the public version added sampling-step widgets.
         const base = this.widgets?.find(w => w.name === 'base_steps');
         if (base && typeof base.value === 'boolean') base.value = 8;
+        // Workflows saved with the earlier 8 + 2 default move to the 8 + 3 default once.
+        if (!args[0]?.properties?.freevideo_refine_v3) {
+            const refine = this.widgets?.find(w => w.name === 'refine_steps');
+            const pass = this.widgets?.find(w => w.name === 'two_pass');
+            if (refine?.value === 2 && base?.value === 8 && pass?.value !== false) refine.value = 3;
+        }
         warn(); return result;
     };
     warn();
@@ -286,6 +296,7 @@ function resultPanel(node) {
             if (!file) continue;
             const link = el("a", label); link.href = outputDownloadURL(api, file); link.download = file === value.video ? '' : file.split("/").pop(); links.append(link);
         }
+        links.append(shareButton(value, text));
         links.append(el("span", value.result_cache_hit ? text("Reused previous result", "已复用上次结果") : value.conditioning_cache_hit ? text("Input cache reused", "已复用输入缓存") : text("Inputs encoded", "已编码输入"), "fv-mode"));
         if (value.result_cache_hit) {
             const again = el('button', text('Regenerate', '重新生成')); again.type = 'button';
@@ -367,15 +378,15 @@ app.registerExtension({
                 }
                 const quality = this.widgets?.find(w => w.name === 'two_pass');
                 if (quality) {
-                    quality.label = text('Two-pass sampling', '二次采样');
-                    quality.tooltip = text('Generate the scene, then refine it at the target resolution.', '先生成画面，再以目标分辨率精修。');
+                    quality.label = text('Two-pass acceleration', '二次采样加速');
+                    quality.tooltip = text('Usually faster: generate at a lower resolution, then upscale and finish sampling at the target size.', '通常更快：先以低分辨率生成，再放大到目标分辨率完成采样，缩短生成时间。');
                 }
                 for (const [name, en, zh] of [['base_steps', 'First-pass steps', '一采步数'], ['refine_steps', 'Second-pass steps', '二采步数']]) {
                     const steps = this.widgets?.find(w => w.name === name);
                     if (steps) {
                         steps.label = text(en, zh);
-                        steps.tooltip = text('Changing sampling steps may reduce generation quality. Defaults: 8 + 2. Second-pass steps must be fewer than first-pass steps.',
-                            '修改采样步数可能降低生成质量。默认一采 8 步、二采 2 步；二采步数必须小于一采步数。');
+                        steps.tooltip = text('Changing sampling steps may reduce generation quality. Defaults: 8 + 3. Other second-pass counts must be fewer than first-pass steps.',
+                            '修改采样步数可能降低生成质量。默认一采 8 步、二采 3 步；其他二采步数需小于一采步数。');
                     }
                 }
                 resultPanel(this);

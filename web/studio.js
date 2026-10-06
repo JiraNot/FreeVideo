@@ -11,7 +11,8 @@ import { animateDetails, closeDialog } from './motion.js';
 import { openLibrary, latestVideo } from './library.js';
 import { createStudioQueue, randomSeed } from './studio_queue.js';
 import { attachReferencePicker, referenceItems, syncReferencePrompt } from './prompt_references.js';
-import { outputDownloadURL } from './output_download.js';
+import { createSamplingEffort } from './sampling_effort.js';
+import { resultActions } from './result_actions.js';
 
 const languageOverride = typeof location !== 'undefined'
     ? new URLSearchParams(location.search).get('freevideo_lang') : null;
@@ -19,6 +20,7 @@ const cn = languageOverride === 'zh' || (languageOverride !== 'en'
     && String(navigator.language || '').toLowerCase().startsWith('zh'));
 const t = (en, zh) => cn ? zh : en;
 const css = document.createElement('link'); css.rel = 'stylesheet'; css.href = new URL('./studio.css', import.meta.url).href; document.head.append(css);
+const effortCss = document.createElement('link'); effortCss.rel = 'stylesheet'; effortCss.href = new URL('./sampling_effort.css', import.meta.url).href; document.head.append(effortCss);
 const el = (tag, label, cls) => { const e = document.createElement(tag); if (label != null) e.textContent = label; if (cls) e.className = cls; return e; };
 const button = (label, action, cls = '') => { const e = el('button', label, cls); e.type = 'button'; e.onclick = action; return e; };
 const widget = (node, name) => node?.widgets?.find(w => w.name === name);
@@ -184,12 +186,28 @@ export function openStudio(node) {
     const twoPass = el('input'); twoPass.type = 'checkbox'; twoPass.checked = value(node, 'two_pass') !== false;
     twoPass.setAttribute('role', 'switch');
     twoPass.disabled = linked(node, 'two_pass') || !widget(node, 'two_pass');
-    twoPass.onchange = () => { set(node, 'two_pass', twoPass.checked); syncSamplingSteps(); };
+    // Two-pass switched off only because first-pass steps left 8; returning to 8 restores it.
+    let autoSinglePass = false;
+    twoPass.onchange = () => { autoSinglePass = false; set(node, 'two_pass', twoPass.checked); syncSamplingSteps(); };
     const twoPassLabel = el('label', null, 'fv-two-pass');
-    twoPassLabel.title = t('Generate the scene, then refine it at the target resolution.', '先生成画面，再以目标分辨率精修。');
+    twoPassLabel.title = t('Generate at a lower resolution, then upscale and finish sampling at the target size to save time.', '先以低分辨率生成，再放大到目标分辨率完成采样，缩短生成时间。');
     twoPass.title = twoPassLabel.title;
-    twoPassLabel.append(el('span', t('Two-pass sampling', '二次采样')), twoPass);
-    canvas.append(twoPassLabel);
+    const twoPassStatus = el('small', '', 'fv-two-pass-status');
+    twoPassLabel.append(el('span', t('Two-pass acceleration', '二次采样加速')), twoPassStatus, twoPass);
+    let effortEstimate = {}, effortEstimateKey = '', effortEstimateTimer = null, effortEstimateRequest = null;
+    const effort = createSamplingEffort(t, {onChange: tier => {
+        baseSteps.value = tier.steps;
+        refineSteps.value = 3;
+        twoPass.checked = tier.twoPass;
+        autoSinglePass = false;
+        set(node, 'two_pass', tier.twoPass);
+        set(node, 'refine_steps', 3);
+        syncSamplingSteps();
+    }, onPreview: tier => tier ? showEffortEstimate(tier.steps, tier.twoPass) : showEffortEstimate()});
+    const samplingSettings = el('div', null, 'fv-sampling-settings');
+    samplingSettings.append(effort.element, twoPassLabel);
+    canvas.append(samplingSettings); cleanup.push(() => effort.dispose());
+    cleanup.push(() => { clearTimeout(effortEstimateTimer); effortEstimateRequest?.abort(); });
     const mediaNode = upstream(node, 'media');
     const [mediaDetails, mediaMount] = expand(t('Media', '素材'));
     if (mediaNode?.freevideoCreateMediaEditor) { cleanup.push(mediaNode.freevideoCreateMediaEditor(mediaMount)); mediaDetails.open = JSON.parse(value(mediaNode, 'assets') || '[]').some(r => r.enabled !== false) || mediaNode.inputs?.some(input => ['first', 'last', 'reference', 'reference_audio'].includes(input.name) && input.link != null); }
@@ -213,12 +231,12 @@ export function openStudio(node) {
     advanced.append(custom);
     const samplingFields = el('div', null, 'fv-fields'); samplingFields.style.marginTop = '14px';
     const baseSteps = el('input'), refineSteps = el('input');
-    const samplingWarning = el('p', t('Changing sampling steps may reduce generation quality. Defaults: 8 + 2 steps.', '修改采样步数可能降低生成质量。默认一采 8 步、二采 2 步。'), 'fv-muted');
+    const samplingWarning = el('p', t('Changing sampling steps may reduce generation quality. Defaults: 8 + 3 steps.', '修改采样步数可能降低生成质量。默认一采 8 步、二采 3 步。'), 'fv-muted');
     samplingWarning.id = `fv-sampling-warning-${node.id}`;
     samplingWarning.style.color = 'var(--fv-warning)';
     for (const [input, name, label, fallback, maximum] of [
         [baseSteps, 'base_steps', t('First-pass steps', '一采步数'), 8, 32],
-        [refineSteps, 'refine_steps', t('Second-pass steps', '二采步数'), 2, 31],
+        [refineSteps, 'refine_steps', t('Second-pass steps', '二采步数'), 3, 31],
     ]) {
         input.type = 'number'; input.min = '1'; input.max = String(maximum); input.step = '1'; input.required = true;
         input.value = value(node, name) ?? fallback;
@@ -227,24 +245,91 @@ export function openStudio(node) {
         input.onchange = () => input.reportValidity();
         samplingFields.append(field(label, input));
     }
+    // Apply the two-pass rule to committed values, never while typing.
+    baseSteps.onchange = () => {
+        // Before validation: one step is valid only once two-pass is off.
+        const steps = Number(baseSteps.value);
+        if (baseSteps.value !== '' && Number.isInteger(steps) && steps >= 1 && steps <= 32
+                && !linked(node, 'two_pass') && widget(node, 'two_pass')) {
+            if (steps !== 8 && twoPass.checked) { twoPass.checked = false; set(node, 'two_pass', false); autoSinglePass = true; }
+            else if (steps === 8 && autoSinglePass) { twoPass.checked = true; set(node, 'two_pass', true); autoSinglePass = false; }
+        }
+        syncSamplingSteps();
+        baseSteps.reportValidity();
+    };
     function syncSamplingSteps() {
         const baseLinked = linked(node, 'base_steps');
+        // Two-pass is offered at 8 first-pass steps. A saved workflow that already
+        // uses it with other steps is shown as custom and left unchanged.
+        const unavailable = Number(baseSteps.value) !== 8 && !twoPass.checked;
+        twoPass.disabled = unavailable || linked(node, 'two_pass') || !widget(node, 'two_pass');
+        twoPassStatus.textContent = unavailable ? t('Coming soon', '即将推出') : '';
+        twoPassLabel.classList.toggle('fv-two-pass-unavailable', unavailable);
         baseSteps.disabled = baseLinked || !widget(node, 'base_steps');
         refineSteps.disabled = !twoPass.checked || linked(node, 'refine_steps') || !widget(node, 'refine_steps');
         baseSteps.min = twoPass.checked ? '2' : '1';
-        refineSteps.max = baseLinked ? '31' : String(Math.max(1, Math.min(31, Number(baseSteps.value || 8) - 1)));
-        refineSteps.setCustomValidity(twoPass.checked && !baseLinked && !refineSteps.disabled && Number(refineSteps.value) >= Number(baseSteps.value)
-            ? t('Second-pass steps must be fewer than first-pass steps.', '二采步数必须小于一采步数。') : '');
-        refineSteps.title = twoPass.checked ? t('Must be fewer than first-pass steps.', '必须小于一采步数。')
-            : t('Enable two-pass sampling to use this setting.', '开启二次采样后生效。');
+        refineSteps.max = baseLinked ? '31' : String(Math.max(3, Math.min(31, Number(baseSteps.value || 8) - 1)));
+        refineSteps.setCustomValidity(twoPass.checked && !baseLinked && !refineSteps.disabled && Number(refineSteps.value) !== 3 && Number(refineSteps.value) >= Number(baseSteps.value)
+            ? t('Other second-pass counts must be fewer than first-pass steps.', '其他二采步数需小于一采步数。') : '');
+        refineSteps.title = twoPass.checked ? t('Three steps use the independent refinement schedule.', '3 步使用独立二采时间表。')
+            : t('Turn on two-pass acceleration to use this setting.', '开启二次采样加速后生效。');
         for (const [input, name] of [[baseSteps, 'base_steps'], [refineSteps, 'refine_steps']]) {
             if (!input.disabled && input.checkValidity() && Number(input.value) !== value(node, name)) {
                 set(node, name, Number(input.value));
             }
         }
+        effort.update({baseSteps: Number(baseSteps.value), refineSteps: Number(refineSteps.value),
+            twoPass: twoPass.checked, disabled: baseSteps.disabled || linked(node, 'two_pass') || linked(node, 'refine_steps')});
+        refreshEffortEstimate();
     }
     syncSamplingSteps();
     advanced.append(samplingFields, samplingWarning);
+    function showEffortEstimate(steps = Number(baseSteps.value), twoPassPlan = twoPass.checked) {
+        const mode = twoPassPlan ? 'two_pass' : 'single';
+        const estimate = effortEstimate[mode]?.[steps];
+        // A previewed level always refines three steps; the current plan may not.
+        if (estimate?.status !== 'estimated' || (mode === 'two_pass' && !arguments.length && Number(refineSteps.value) !== 3)) {
+            effort.setEstimate('', t('Estimates appear after a matching generation on this computer.', '本机有相近生成记录后显示预计耗时。'));
+            return;
+        }
+        const minutes = estimate.high_seconds >= 90, scale = minutes ? 60 : 1;
+        const low = Math.max(1, Math.floor(estimate.low_seconds / scale));
+        const high = Math.max(low + 1, Math.ceil(estimate.high_seconds / scale));
+        const unit = minutes ? t('min', '分钟') : t('s', '秒');
+        const extra = estimate.includes_text_encoding ? '' : t(' + prompt', ' + 提示词准备');
+        effort.setEstimate(`${t('~', '约 ')}${low}–${high} ${unit}${extra}`,
+            t('Based on complete local runs. Includes loading and decoding; first use or other applications may take longer.',
+                '根据本机完整生成记录估算，包含加载与解码；首次准备或其他程序占用可能延长时间。'));
+    }
+    function refreshEffortEstimate(force = false) {
+        let task = 'external';
+        try {
+            if (!linked(node, 'conditioning')) {
+                const media = referenceItems(node), refs = media.filter(r => !r.role);
+                const audio = refs.some(r => r.kind === 'audio'), visual = refs.some(r => r.kind !== 'audio');
+                const first = media.some(r => r.role === 'first'), last = media.some(r => r.role === 'last');
+                task = audio ? visual ? 'ref2va_av' : 'ref2va_audio' : visual ? 'ref2va'
+                    : first && last ? 'fl2va' : first ? 'i2va' : last ? 'l2va' : 't2va';
+            }
+        } catch {} // Unknown connected inputs must not reuse text-only timings.
+        let adapters = false;
+        try { adapters = JSON.parse(value(loraNode, 'adapters') || '[]').some(r => r.enabled !== false && Number(r.strength ?? 1) !== 0); } catch {}
+        if (loraNode && !widget(loraNode, 'adapters')) adapters = value(loraNode, 'lora') !== 'None';
+        const query = new URLSearchParams({width: value(node, 'width'), height: value(node, 'height'), seconds: value(node, 'seconds'), task, adapters: adapters ? '1' : '0'}).toString();
+        if (query === effortEstimateKey && !force) { showEffortEstimate(); return; }
+        clearTimeout(effortEstimateTimer);
+        effortEstimateKey = query; effortEstimate = {}; showEffortEstimate(); effortEstimateRequest?.abort();
+        effortEstimateTimer = setTimeout(async () => {
+            const controller = new AbortController(); effortEstimateRequest = controller;
+            try {
+                const reply = await api.fetchApi('/freevideo/sampling-estimate?' + query, {signal: controller.signal});
+                if (!reply.ok) return;
+                const estimate = await reply.json();
+                if (disposed || controller.signal.aborted || effortEstimateKey !== query) return;
+                effortEstimate = estimate; showEffortEstimate();
+            } catch {} // An unavailable estimate must not block the editor.
+        }, 220);
+    }
     const seedFields = el('div', null, 'fv-fields'); seedFields.style.marginTop = '14px';
     const seed = el('input'); seed.type = 'number'; seed.min = '0'; seed.max = String(2 ** 53 - 1); seed.step = '1'; seed.value = value(node, 'seed'); seed.disabled = linked(node, 'seed'); seed.setAttribute('aria-label', t('Seed', '种子'));
     seed.onchange = () => { if (seed.value && seed.reportValidity()) set(node, 'seed', Number(seed.value)); };
@@ -302,6 +387,7 @@ export function openStudio(node) {
         stats.hidden = true;
         budget.textContent = '';
         links.replaceChildren();
+        delete progress.report.dataset.covered;
         prewarm.textContent = '';
         clearTimeout(revealTimer); revealTimer = null; delete stage.dataset.revealing;
         if (progress.element.hidden) stage.querySelector('video')?.pause();
@@ -322,12 +408,13 @@ export function openStudio(node) {
         catch (error) { regenerate.disabled = false; status.dataset.error = 'true'; status.textContent = error.message; }
     }, 'fv-quiet');
     reuseRow.append(reuseNotice, regenerate);
-    output.append(status, reuseRow, stats, budget, links, progress.report, prewarm);
+    output.append(status, reuseRow, links, stats, budget, progress.report, prewarm);
     const failure = createErrorPanel(t); output.append(failure.element);
     if (node.freevideoFailure) failure.show(node.freevideoFailureReport || node.freevideoFailure, false);
     let result = node.freevideoLastResult || app.nodeOutputs?.[node.id]?.freevideo_summary?.[0];
     function showResult(r) {
         if (!r?.video || disposed) return; result = r;
+        refreshEffortEstimate(true);
         progress.updateReport({report_id: node.freevideoReportId});
         stage.querySelector('video')?.pause(); stageMedia.replaceChildren();
         const video = el('video'); video.src = view(r.video, 'output'); video.controls = true; video.preload = 'metadata'; video.playsInline = true; stageMedia.append(video);
@@ -341,8 +428,9 @@ export function openStudio(node) {
         budget.textContent = r.result_cache_hit ? '' : unified
             ? (Number.isFinite(r.unified_reserve_bytes) ? `${t('Reserved unified memory', '预留统一内存')} ${number(r.unified_reserve_bytes, 2 ** 30, 'GiB')}` : '')
             : (Number.isFinite(r.gpu_budget_bytes) ? `${t('VRAM budget', '可用显存预算')} ${number(r.gpu_budget_bytes, 2 ** 30, 'GiB')} · ${t('Device', '显卡总量')} ${number(r.gpu_total_bytes, 2 ** 30, 'GiB')}` : '');
-        links.replaceChildren();
-        for (const [label, file, cls] of [[t('Download video', '下载视频'), r.video, 'fv-primary'], [t('Report', '查看报告'), r.report, 'fv-quiet']]) { if (!file) continue; const a = el('a', label, cls); a.href = outputDownloadURL(api, file); a.download = file === r.video ? '' : file.split('/').pop(); links.append(a); }
+        // One report entry: the diagnostic export joins the report menu once a result exists.
+        progress.report.dataset.covered = 'true';
+        links.replaceChildren(resultActions(r, t, {diagnostic: progress.hasReport() ? progress.downloadReport : null}));
         const g = r.geometry; if (g?.width && g?.height) previewSize(g.width, g.height);
         if (!progress.element.hidden) {
             progress.update({phase: 'complete', overall: {status: 'complete', fraction: 1, remaining_seconds: 0}});
@@ -495,6 +583,9 @@ export function openStudio(node) {
     }
     async function submitDraft() {
         if (capturing || queueState?.submitting) return;
+        // Ctrl+Enter leaves focus in a field: commit its edit (change fires on blur) first.
+        const editing = dialog.contains(document.activeElement) ? document.activeElement : null;
+        if (editing && editing !== generate) { editing.blur(); editing.focus({preventScroll: true}); }
         if ([...dialog.querySelectorAll('input:not(:disabled)')].some(e => !e.reportValidity())) return;
         if (!prompt.disabled && !prompt.value.trim()) { prompt.focus(); status.textContent = t('Describe your scene first.', '请先描述画面。'); return; }
         const chosenMode = runMode, batchCount = chosenMode === 'batch' ? Number(count.value) : 1;
@@ -543,6 +634,7 @@ export function openStudio(node) {
         shapes.style.setProperty('--fv-shape-index', Math.max(0, shapeIndex));
         shapes.dataset.custom = String(shapeIndex < 0);
         if (!busy) previewSize(Number(width.value), Number(height.value));
+        refreshEffortEstimate();
     }
     function applySize() {
         if (dimensionsLinked) return;
@@ -568,7 +660,10 @@ export function openStudio(node) {
     }
     mp.onchange = () => { try { pixels = Number(mp.value); applySize(); } catch (error) { status.dataset.error = 'true'; status.textContent = error.message; } };
     seconds.onchange = () => { if (seconds.value && seconds.reportValidity()) { set(node, 'seconds', Number(seconds.value)); updateCanvas(); } };
-    const mediaChanged = async e => { if (String(e.detail) !== String(mediaNode?.id) || selected !== 'input') return; try { await inputRatio(); } catch (error) { status.textContent = error.message; } };
+    const mediaChanged = async e => { if (String(e.detail) !== String(mediaNode?.id)) return; refreshEffortEstimate(); if (selected !== 'input') return; try { await inputRatio(); } catch (error) { status.textContent = error.message; } };
+    const lorasChanged = e => { if (String(e.detail) === String(loraNode?.id)) refreshEffortEstimate(); };
+    window.addEventListener('freevideo-loras', lorasChanged);
+    cleanup.push(() => window.removeEventListener('freevideo-loras', lorasChanged));
     const resultChanged = e => { if (String(e.detail.node) === String(node.id)) { failure.clear(); showResult(e.detail.value); cancelling = false; status.textContent = ''; syncQueue().catch(() => {}); } };
     const prewarmChanged = e => { if (String(e.detail.node) === String(node.id)) prewarm.textContent = e.detail.label; };
     window.addEventListener('freevideo-prewarm', prewarmChanged);

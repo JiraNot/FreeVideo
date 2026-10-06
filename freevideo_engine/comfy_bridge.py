@@ -367,7 +367,7 @@ def progress_message(event):
         if event.get('enabled') and second:
             return dict(label='Two-pass · %d × %d → %d × %d · %d + %d steps' %
                         (first['width'], first['height'], second['width'], second['height'],
-                         event.get('base_steps', 8), event.get('refine_steps', 2)),
+                         event.get('base_steps', 8), event.get('refine_steps', 3)),
                         detail='Audio is preserved from the first pass', sampling_plan=event)
         return dict(label='Single-pass · %d steps' % event.get('base_steps', 8), detail=event.get('reason'), sampling_plan=event)
     if name == 'latent_upscaler_prepare':
@@ -461,7 +461,7 @@ def engine_environment(root, source, environ=None):
 def generate(prompt, width, height, seconds, seed, output_directory, *,
              source=None, environ=None, metadata=None, progress=None, interrupted=None,
              release_models=None, export_inputs=None, two_pass=True, encoder_prewarm=None,
-             force_regenerate=False, base_steps=8, refine_steps=2):
+             force_regenerate=False, base_steps=8, refine_steps=3, comfy_metadata=None):
     if type(two_pass) is not bool:
         raise ValueError('Two-pass generation must be a boolean')
     if type(force_regenerate) is not bool:
@@ -563,6 +563,25 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
             send_progress({'label': 'Reused previous result', 'phase': 'complete',
                            'result_cache_hit': True})
             return reused
+        from .sampling_assets import engine_task, prepare as prepare_sampling_assets
+        def asset_progress(message):
+            if progress:
+                progress(dict(message, report_id=report_id))
+        preparation_started = time.monotonic()
+        try:
+            # Reference audio selects its own tables; match the encoder's choice.
+            preparation = prepare_sampling_assets(root, machine, planned, engine_task(extra.get('media', {}), run),
+                progress=asset_progress, interrupted=interrupted, environ=environment)
+        except BaseException:
+            elapsed = time.monotonic() - preparation_started
+            state['sampling_cache_install'] = dict(status='failed', seconds=elapsed)
+            started += elapsed
+            raise
+        state['sampling_cache_install'] = preparation
+        if preparation['seconds']:
+            started += preparation['seconds']
+            whole_progress = WholeVideoProgress()
+            send_progress({'reset': True, 'label': 'Preparing video'})
         whole_progress.sampling_plan = planned
         whole_progress.forecast(progress_history_forecast(root, machine, dict(canvas, sampling_plan=planned)))
         send_progress({'label': 'Preparing %.3f s video + audio · %d × %d' %
@@ -607,6 +626,11 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
                 or any(engine.get('geometry', {}).get(k) != canvas[k] for k in ('width', 'height', 'frames'))):
             from .failure_details import generation_failure
             raise RuntimeError('FreeVideo did not complete the requested video.\n' + generation_failure(run))
+        if comfy_metadata:
+            # Dropping the video on the canvas restores this graph, as with ComfyUI's own video nodes.
+            # Written before the result cache records the file's size and hash.
+            from .comfy_metadata import embed_comfy_metadata
+            state['workflow_in_video'] = embed_comfy_metadata(output, **comfy_metadata)
         state.update(status='complete', request_seconds=report.get('request_seconds'),
                      engine_report=str(output.with_suffix('.engine.json')))
         # Do not index a result against inputs/models that changed while it ran.
@@ -645,6 +669,7 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
         from .resident_process import OWNER
         OWNER.active = False
         state['bridge_seconds'] = time.monotonic() - started
+        state['bridge_wall_seconds'] = state['bridge_seconds'] + state.get('sampling_cache_install', {}).get('seconds', 0.)
         save(run / 'comfy-request.json', state)
         from .support_report import write as write_debug
         write_debug(output, bridge=state)

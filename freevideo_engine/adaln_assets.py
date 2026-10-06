@@ -156,10 +156,12 @@ def validate_catalog(manifest, count):
 def optional_table(expected, manifest):
     """Select only exact, published constants; LoRA/clock changes cannot match."""
     catalog = json.loads(Path(__file__).with_name('prepared_models.json').read_text(encoding='utf-8'))
-    optional = catalog.get('optional_adaln', {})
-    table = next((t for t in optional.get('tables', []) if t['identity'] == expected), None)
-    if table is None:
+    banks = [catalog.get('optional_adaln', {})] + catalog.get('optional_adaln_sets', [])
+    match = next(((bank, table) for bank in banks for table in bank.get('tables', [])
+                  if table['identity'] == expected), None)
+    if match is None:
         return None
+    optional, table = match
     if (not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', optional.get('repo', ''))
             or not re.fullmatch('[0-9a-f]{40}', optional.get('revision', ''))):
         raise ValueError('Optional sampling preset has no pinned source')
@@ -169,11 +171,12 @@ def optional_table(expected, manifest):
     return dict(table, download=dict(repo=optional['repo'], revision=optional['revision'], prefix=prefix))
 
 
-def _download_plan():
+def _download_plan(root=None):
     from . import network
     from .paths import data_root
+    root = Path(root) if root is not None else data_root()
     plan = network.installed_plan()
-    machine = data_root() / 'machine.json'
+    machine = root / 'machine.json'
     if not plan and machine.is_file():
         installed = json.loads(machine.read_text(encoding='utf-8'))
         plan = installed.get('network', {}) or {}
@@ -181,7 +184,7 @@ def _download_plan():
             setup = Path(installed['setup_run']) / 'plan.json'
             if setup.is_file():
                 plan = json.loads(setup.read_text(encoding='utf-8')).get('network', {}) or {}
-    plan.setdefault('download_settings_path', str(data_root() / 'download-settings.json'))
+    plan.setdefault('download_settings_path', str(root / 'download-settings.json'))
     plan.setdefault('sources', {}).setdefault('models', [{'id': 'official'}, {'id': 'hf-mirror'}])
     return plan
 

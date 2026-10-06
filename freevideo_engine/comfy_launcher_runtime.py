@@ -494,9 +494,11 @@ class Controller:
         ready = False
         if not values.get('repair'):
             try:
-                installation(source, {'FREEVIDEO_HOME': str(engine)})
-                ready = True
-            except (OSError, ValueError):
+                _, machine = installation(source, {'FREEVIDEO_HOME': str(engine)})
+                # With every quality level requested, set up again only while some are missing.
+                from .sampling_assets import installed as sampling_installed
+                ready = not values.get('sampling_caches') or sampling_installed(machine)
+            except (OSError, ValueError, KeyError):
                 pass
         self.selection = dict(descriptor, engine=str(engine), source=str(source), url=url, ready=ready)
         self.state = dict(self.state, selection=dict(self.selection), host=host)
@@ -506,6 +508,7 @@ class Controller:
                 raise ValueError('Model folders must be a list of directory paths')
             extra = extra + ([values['models']] if values.get('models') else [])
             self.setup.inspect(dict(root=str(engine), extra_libraries=extra, copy=False,
+                sampling_caches=bool(values.get('sampling_caches')),
                 frontend=dict(root=descriptor['root'], separate=descriptor['separate'], download=fresh)))
             row = self._wait_setup()
             self.state = dict(self.state, plan=row['plan'])

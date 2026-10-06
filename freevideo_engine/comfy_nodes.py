@@ -39,17 +39,17 @@ class FreeVideoGenerate(io.ComfyNode):
                     tooltip='Native H3 layer-50 conditioning including keyframe/reference metadata. '
                             'Replaces prompt/media encoding. Generic CLIP conditioning is incompatible.'),
                 Media.Input('media', optional=True, tooltip='Unified Media panel: keyframes or ordered references.'),
-                io.Boolean.Input('two_pass', display_name='Two-pass sampling', default=True, optional=True,
-                    tooltip='Generate the scene, then refine it at the target resolution.'),
+                io.Boolean.Input('two_pass', display_name='Two-pass acceleration', default=True, optional=True,
+                    tooltip='Usually faster: generate at a lower resolution, then upscale and finish sampling at the target size.'),
                 io.Int.Input('base_steps', display_name='First-pass steps', default=8, min=1, max=32, optional=True,
                     tooltip='Default: 8. Changing sampling steps may reduce generation quality.'),
-                io.Int.Input('refine_steps', display_name='Second-pass steps', default=2, min=1, max=31, optional=True,
-                    tooltip='Default: 2. Must be fewer than first-pass steps. Changing sampling steps may reduce generation quality.'),
+                io.Int.Input('refine_steps', display_name='Second-pass steps', default=3, min=1, max=31, optional=True,
+                    tooltip='Default: 3. Three steps use the independent refinement schedule. Changing sampling steps may reduce generation quality.'),
                 io.Boolean.Input('force_regenerate', display_name='Force regeneration', default=False, optional=True,
                     tooltip='Generate again even when an identical completed video is saved locally.'),
             ],
             outputs=[io.Video.Output('video'), io.String.Output('report', display_name='Report JSON')],
-            hidden=[io.Hidden.unique_id, io.Hidden.extra_pnginfo],
+            hidden=[io.Hidden.unique_id, io.Hidden.prompt, io.Hidden.extra_pnginfo],
             is_output_node=True, not_idempotent=True,
         )
 
@@ -58,7 +58,7 @@ class FreeVideoGenerate(io.ComfyNode):
         try:
             comfy_bridge.validate_request(text, width, height, seconds, seed)
             from .two_pass import validate_steps
-            validate_steps(kwargs.get('base_steps', 8), kwargs.get('refine_steps', 2), kwargs.get('two_pass', True))
+            validate_steps(kwargs.get('base_steps', 8), kwargs.get('refine_steps', 3), kwargs.get('two_pass', True))
             comfy_bridge.installation()
         except (OSError, ValueError, KeyError) as error:
             return str(error)
@@ -73,7 +73,7 @@ class FreeVideoGenerate(io.ComfyNode):
     @classmethod
     def execute(cls, text, width, height, seconds, seed, first=None, last=None,
                 references=None, loras=None, conditioning=None, media=None, two_pass=True,
-                force_regenerate=False, base_steps=8, refine_steps=2):
+                force_regenerate=False, base_steps=8, refine_steps=3):
         from .two_pass import validate_steps
         validate_steps(base_steps, refine_steps, two_pass)
         from .comfy_media import export
@@ -93,7 +93,7 @@ class FreeVideoGenerate(io.ComfyNode):
         def progress(message):
             if message.get('result_cache_hit'):
                 result_reused[0] = True
-            label = message['label']
+            label = message.get('label') or 'Generating video'
             count = (message.get('done'), message.get('total'))
             if message.get('done') is not None and count != last_count[0]:
                 bar.update_absolute(message['done'], message['total'])
@@ -114,13 +114,19 @@ class FreeVideoGenerate(io.ComfyNode):
                 memory.unload_all_models()
                 memory.soft_empty_cache()
         metadata = cls.hidden.extra_pnginfo or {}
+        try:
+            from comfy.cli_args import args as comfy_args
+            embed = not comfy_args.disable_metadata
+        except (ImportError, AttributeError):
+            embed = True
+        graph = dict(prompt=getattr(cls.hidden, 'prompt', None), workflow=metadata.get('workflow')) if embed else None
         output_root = Path(folder_paths.get_output_directory()).resolve()
         publish(PromptServer.instance, node_id, {'label': 'Preparing video', 'new_request': True})
         try:
             output = comfy_bridge.generate(text, width, height, seconds, seed, output_root,
                 metadata=metadata.get('workflow', metadata), progress=progress, two_pass=two_pass,
                 encoder_prewarm=prewarm, force_regenerate=force_regenerate,
-                base_steps=base_steps, refine_steps=refine_steps,
+                base_steps=base_steps, refine_steps=refine_steps, comfy_metadata=graph,
                 interrupted=memory.throw_exception_if_processing_interrupted, release_models=release,
                 export_inputs=lambda run, canvas: export(run, canvas, first=first, last=last,
                     references=references, loras=loras, conditioning=conditioning, assets=media))

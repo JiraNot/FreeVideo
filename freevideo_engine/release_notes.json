@@ -1,20 +1,18 @@
 {
   "schema": 1,
-  "product_version": "0.1.1",
+  "product_version": "0.2.3",
   "en": {
-    "summary": "Generation with audio or mixed references works again.",
+    "summary": "Videos you made earlier get their workflow too.",
     "changes": [
-      "Image plus audio and other mixed-reference requests no longer fail while downloading reference resources; the default 8-step schedule uses small published tables instead of the original projection weights.",
-      "Reference resources follow your download source and connection settings, and resume after an interruption.",
-      "Reference-resource downloads show their progress."
+      "Videos made before v0.2.2 can get their ComfyUI workflow too, so they can be dragged onto the canvas as well. Creations offers it, and nothing changes until you confirm. Each original is kept next to its video as video.before-workflow.mp4 and can be deleted once you have checked the video.",
+      "A video is rewritten only when its saved workflow is complete and the new file matches the original exactly. Anything else is left as it is."
     ]
   },
   "zh": {
-    "summary": "修复音频及混合参考无法生成的问题。",
+    "summary": "之前生成的视频也会补上工作流。",
     "changes": [
-      "修复图片加音频等混合参考在下载参考资源时失败的问题；默认 8 步改用已发布的小型调制表，不再下载原始投影权重。",
-      "参考资源按所选下载源和网络设置下载，中断后可继续。",
-      "下载参考资源时显示进度。"
+      "v0.2.2 之前生成的视频也能补上 ComfyUI 工作流，补写后同样可以拖到画布上还原。\"作品\"中会给出提示，确认后才会补写。原视频保留在同一目录，文件名为 video.before-workflow.mp4，确认无误后可以自行删除。",
+      "只有在保存的工作流完整、且新文件与原视频完全一致时才会改写，其他情况保持原样。"
     ]
   }
 }

@@ -98,18 +98,24 @@ export function createGenerationProgress(t, now = () => Date.now(), {compact = f
         // only a new request clears it.
         return reportId;
     }
+    // Download the redacted diagnostic export; throws when it is unavailable.
+    async function downloadReport() {
+        const id = reportId;
+        if (!id) throw new Error('Report unavailable');
+        const path = `/freevideo/report/${id}`;
+        const response = await (api ? api.fetchApi(path) : fetch(path));
+        if (!response.ok) throw new Error('Report unavailable');
+        const blob = await response.blob(), url = URL.createObjectURL(blob);
+        const link = document.createElement('a'); link.href = url; link.download = 'video.debug.json';
+        document.body.append(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
     report.onclick = async () => {
         if (!reportId || report.disabled) return;
         const id = reportId;
         report.disabled = true; report.textContent = t('Preparing report…', '正在整理报告…');
         try {
-            const path = `/freevideo/report/${id}`;
-            const response = await (api ? api.fetchApi(path) : fetch(path));
-            if (!response.ok) throw new Error('Report unavailable');
-            const blob = await response.blob(), url = URL.createObjectURL(blob);
-            const link = document.createElement('a'); link.href = url; link.download = 'video.debug.json';
-            document.body.append(link); link.click(); link.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            await downloadReport();
             if (id === reportId) report.textContent = reportLabel();
         } catch {
             if (id === reportId) report.textContent = t('Report unavailable · retry', '报告暂不可用 · 重试');
@@ -196,6 +202,10 @@ export function createGenerationProgress(t, now = () => Date.now(), {compact = f
     function tick() {
         if (element.hidden) return;
         const ended = overall.status === 'complete' || overall.status === 'failed';
+        if (state.phase === 'dependencies') {
+            elapsed.hidden = eta.hidden = silence.hidden = true;
+            drawOverall(); return;
+        }
         const age = Math.max(0, (now() - sampledAt) / 1000);
         const overallAge = ended ? 0 : Math.max(0, (now() - overallAt) / 1000);
         const seconds = valid(overall.elapsed_seconds) ? overall.elapsed_seconds + overallAge : (now()-started)/1000;
@@ -292,6 +302,9 @@ export function createGenerationProgress(t, now = () => Date.now(), {compact = f
                 : phase === 'recovery' ? t('Adjusting memory · retrying', '调整内存 · 重试中')
                 : t('Preparing video', '准备生成');
         }
+        if (message.phase === 'dependencies') label.textContent = message.stage === 'probe'
+            ? t('Installing sampling cache · testing sources', '补安装采样缓存 · 正在测速')
+            : t('Installing sampling cache', '补安装采样缓存');
         if (sampling && Number.isInteger(message.block)) {
             detail.textContent = t(`Step ${message.done+1} · processing layer ${message.block} / ${message.blocks}`,
                 `第 ${message.done+1} 步 · 正在处理第 ${message.block} / ${message.blocks} 层`);
@@ -301,8 +314,9 @@ export function createGenerationProgress(t, now = () => Date.now(), {compact = f
                 : message.done > 0 ? t(`${message.done} steps complete`, `已完成 ${message.done} 步`)
                 : t('Starting the first step', '正在开始第一步');
         } else detail.textContent = message.detail || '';
-        if (downloadLabel && valid(message.done) && valid(message.total)) {
-            detail.textContent = `${(message.done/2**20).toFixed(1)} / ${(message.total/2**20).toFixed(1)} MiB`;
+        if ((downloadLabel || message.phase === 'dependencies') && valid(message.done) && valid(message.total)) {
+            detail.textContent = `${(message.done/2**20).toFixed(1)} / ${(message.total/2**20).toFixed(1)} MiB`
+                + (valid(message.bytes_per_second) && message.bytes_per_second > 0 ? ` · ${(message.bytes_per_second/2**20).toFixed(1)} MiB/s` : '');
         } else if (hasCount) detail.textContent = `${message.done} / ${message.total}${detail.textContent ? ' · ' + detail.textContent : ''}`;
         detail.dataset.baseText = detail.textContent;
         note.hidden = !(sampling && message.done === 0);
@@ -315,5 +329,5 @@ export function createGenerationProgress(t, now = () => Date.now(), {compact = f
         if (timer !== null) clearInterval(timer); timer = null; state = {}; overall = {}; shownFraction = null;
         stopCount(); countShown = null;
     }
-    return {element, report, updateReport, update, hide, dispose: hide};
+    return {element, report, updateReport, downloadReport, hasReport: () => reportId !== null, update, hide, dispose: hide};
 }
